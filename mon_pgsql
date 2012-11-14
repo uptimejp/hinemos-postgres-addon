@@ -1,0 +1,919 @@
+#!/usr/bin/perl
+
+# ----------------------------------------------------------------
+# mon_pgsql - PostgreSQL Monitoring Kit for Hinemos
+#
+# Copyright(C) 2012 Uptime Technologies, LLC.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; version 2 of the License.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+# ----------------------------------------------------------------
+
+use strict vars;
+use Getopt::Std;
+use POSIX qw(strftime);
+use FileHandle;
+use IPC::Open2;
+use POSIX qw(strftime);
+
+my $PGHOST = 'localhost';
+my $PGPORT = 5432;
+my $PGUSER = 'postgres';
+my $DBNAME = 'postgres';
+
+my @CACHE_DATA = ();
+my @PREV_DATA = ();
+
+my $cache_file = '/var/tmp/mon_pgsql.cache';
+#my $log_file;
+my $log_file = '/opt/hinemos_agent/var/log/mon_pgsql.log';
+
+my $search_key;
+
+my $verbose = 0;
+
+sub _debug {
+    my $msg = $_[0];
+    my $ts = strftime("[%Y-%m-%d %H:%M:%S] ", localtime);
+
+    if ( $verbose )
+    {
+	if ( $log_file )
+	{
+	    open(LOG, ">> $log_file") || die($!);
+	    print LOG $ts . "DEBUG: " . $msg . "\n";
+	    close(LOG);
+	}
+	else
+	{
+	    print $ts . "DEBUG: " . $msg . "\n";
+	}
+    }
+}
+
+sub _error {
+    my $msg = $_[0];
+
+    my $ts = strftime("[%Y-%m-%d %H:%M:%S] ", localtime);
+
+    if ( $log_file )
+    {
+	open(LOG, ">> $log_file") || die($!);
+	print $ts . "ERROR: " . $msg . "\n";
+	close(LOG);
+    }
+    else
+    {
+	print $ts . "ERROR: " . $msg . "\n";
+    }
+}
+
+sub parse_opts {
+    my %opts = ();
+
+    getopts("h:p:U:d:v", \%opts);
+
+    if ( $opts{'h'} )
+    {
+	$PGHOST = $opts{'h'};
+    }
+    if ( $opts{'p'} )
+    {
+	$PGPORT = $opts{'p'};
+    }
+    if ( $opts{'U'} )
+    {
+	$PGUSER = $opts{'U'};
+    }
+    if ( $opts{'d'} )
+    {
+	$DBNAME = $opts{'d'};
+    }
+    if ( $opts{'l'} )
+    {
+	$log_file = '/opt/hinemos_agent/var/log/mon_pgsql.log';
+    }
+    if ( $opts{'v'} )
+    {
+	$verbose = 1;
+    }
+}
+
+sub print_usage {
+    print "\n";
+    print "Usage: $0 [<option>...] <search_key>\n";
+    print "\n";
+    print "Options:\n";
+    print "    -h <host>     Host name to connect the database.\n";
+    print "    -p <port>     Port number to connect the database.\n";
+    print "    -U <user>     User name used to connect the database.\n";
+    print "    -d <dbname>   Database name to be connected.\n";
+    print "    -v            Verbose output.\n";
+    print "\n";
+    print "Search keys:\n";
+    print "    session       \n";
+    print "    cache_hit     \n";
+    print "    tuple_wrtn    \n";
+    print "    tuple_read    \n";
+    print "    blks_read     \n";
+    print "    blks_wrtn     \n";
+    print "    txn           \n";
+    print "    xlog_wrtn     \n";
+    print "    dbsize        \n";
+    print "    locks         \n";
+    print "\n";
+}
+
+# -------------------------------------------------------------------------
+# Check whether the search key is correct.
+# -------------------------------------------------------------------------
+sub check_search_key {
+    my $key = $_[0];
+
+    if ( $key eq "session" ||
+	 $key eq "cache_hit" ||
+	 $key eq "blks_read" ||
+	 $key eq "blks_wrtn" ||
+	 $key eq "tuple_read" ||
+	 $key eq "tuple_wrtn" ||
+	 $key eq "txn" ||
+	 $key eq "xlog_wrtn" ||
+	 $key eq "dbsize" ||
+	 $key eq "locks" )
+    {
+	return 1;
+    }
+    return 0;
+}
+
+# -------------------------------------------------------------------------
+# Check whether the cache needs to be updated.
+# 
+# The cache needs to be updated when it has past >50 seconds
+# after the previous refresh.
+# -------------------------------------------------------------------------
+sub IsCacheRefreshNeeded {
+    my $rc = 0;
+
+    if ( -f $cache_file )
+    {
+	my @st = stat($cache_file);
+
+	&_debug("Cache file `" . $cache_file . "' was created on " .
+		     strftime("%a %b %e %H:%M:%S %Y", localtime($st[10])) .
+		     " (" . (time-$st[10]) . " seconds ago).");
+
+	# the cache file was expired (older than 50 seconds).
+	# So, needs to create new one.
+	if ( time - $st[10] > 50 )
+	{
+	    &_debug("Cache file needs to be updated.");
+	    $rc = 1;
+	}
+    }
+    else
+    {
+	# the cache file not found. need to create new one.
+	&_debug("Cache file `$cache_file' not found.");
+	$rc = 1;
+    }
+
+    $rc;
+}
+
+# -------------------------------------------------------------------------
+# Calculate an interval between the latest scan and the previous one
+# in seconds.
+# -------------------------------------------------------------------------
+sub get_interval {
+    my $t1;
+    my $t2;
+    foreach (@PREV_DATA)
+    {
+	if ( /^time (\d+)/ )
+	{
+	    $t1 = $1;
+	}
+    }
+    foreach (@CACHE_DATA)
+    {
+	if ( /^time (\d+)/ )
+	{
+	    $t2 = $1;
+	}
+    }
+
+    &_debug("prev created on " . 
+	    strftime("%a %b %e %H:%M:%S %Y", localtime($t1)));
+    &_debug("cache created on " .
+	    strftime("%a %b %e %H:%M:%S %Y", localtime($t2)));
+    &_debug("interval: " . ($t2 - $t1));
+
+    return ($t2 - $t1);
+}
+
+# -------------------------------------------------------------------------
+# Calculate differences between two lines which include several values
+# at once.
+#
+# Example:
+#   Line 1: blks 4004 91278891 550874 0 739
+#   Line 2: blks 4009 91285632 550877 2 740
+#   Result: blks 5 6741 3 2 1
+# -------------------------------------------------------------------------
+sub calc_diff {
+    my $line1 = $_[0];
+    my $line2 = $_[1];
+    my $res;
+
+    chomp($line1);
+    chomp($line2);
+
+    my @v1 = split(/ +/, $line1);
+    my @v2 = split(/ +/, $line2);
+
+    for (my $i=0 ; $i<=$#v1 ; $i++)
+    {
+        if ( $v1[$i] =~ /^\d+$/ && $v2[$i] =~ /^\d+$/ )
+        {
+            if ( $res )
+            {
+                $res .= " ";
+            }
+            $res .= ($v2[$i] - $v1[$i]);
+        }
+        else
+        {
+            if ( $res )
+            {
+                $res .= " ";
+            }
+            $res .= $v1[$i];
+        }
+    }
+
+    $res;
+}
+
+# -------------------------------------------------------------------------
+# Execute a query and return a result set.
+#
+# A result set contains one or more lines.
+# -------------------------------------------------------------------------
+sub ExecuteQuery {
+    my $q = $_[0];
+    my @rs;
+
+    my $PSQL_OPTS = "-h $PGHOST -p $PGPORT -U $PGUSER";
+
+    my $pid = open2(*FIN, *FOUT, "psql $PSQL_OPTS -q -t -A -F' '");
+    print FOUT $q . ";\n";
+    print FOUT "\\q\n";
+    while(<FIN>)
+    {
+	push(@rs, $_);
+    }
+    
+    @rs;
+}
+
+# -------------------------------------------------------------
+# Update cache file.
+#
+# To avoid from a disk full error, the cache file must have
+# fixed size, and overwrite it when it needs to be updated.
+# -------------------------------------------------------------
+sub UpdateCache {
+    my $file = $_[0];
+    my $data = $_[1];
+    my $size = $_[2];
+
+    # if a cache file not found,
+    # needs to create an empty cache file at first.
+    if ( ! -f $file )
+    {
+	open(F, "> $file") || die($!);
+	for (my $i=0 ; $i < $size ; $i++)
+	{
+	    print F "\n";
+	}
+	close(F);
+    }
+
+    # overwrite the cache file, and fill the unused space
+    # with '\n'.
+    open(F, "+< $file") || die($!);
+    seek(F, 0, 0);
+
+    print F $data;
+
+    for (my $i=0 ; $i < $size - length($data) ; $i++)
+    {
+	print F "\n";
+    }
+
+    close(F);
+}
+
+# -------------------------------------------------------------
+# Get statistics with executing queries for several system
+# views.
+# -------------------------------------------------------------
+sub GetStatistics {
+    my $q = "
+BEGIN;
+
+SELECT 'time', extract(epoch FROM now())::integer;
+
+SELECT 'session',
+       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND current_query NOT LIKE '<IDLE%' ) AS active,
+       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND current_query LIKE '<IDLE%' ) AS idle,
+       (SELECT count(*) FROM pg_stat_activity WHERE waiting='t') AS wait;
+
+SELECT 'txn',
+       sum(xact_commit) AS xact_commit,
+       sum(xact_rollback) AS xact_rollback
+  FROM pg_stat_database;
+
+SELECT 'tuples',
+       sum(tup_returned) AS tup_returned,
+       sum(tup_fetched) AS tup_fetched,
+       sum(tup_inserted) AS tup_inserted,
+       sum(tup_updated) AS tup_updated,
+       sum(tup_deleted) AS tup_deleted
+  FROM pg_stat_database;
+
+SELECT 'locks',
+       (SELECT count(*) FROM pg_locks WHERE granted=true) as locks_acquired,
+       (SELECT count(*) FROM pg_locks WHERE granted=false) AS locks_wait;
+
+SELECT 'dbsize', sum(pg_database_size(datname)) FROM pg_database;
+
+SELECT 'blks', *
+  FROM (SELECT sum(blks_read) AS blks_read,
+               sum(blks_hit) AS blks_hit
+          FROM pg_stat_database) AS a,
+       (SELECT buffers_checkpoint AS blks_wrtn_chkpt,
+               buffers_clean AS blks_wrtn_bgw,
+               buffers_backend AS blks_wrtn_bkend
+          FROM pg_stat_bgwriter) AS b;
+
+SELECT 'xlog' as xlog,
+       pg_current_xlog_location() as xlog_loc,
+       pg_current_xlog_insert_location() as xlog_insert_loc;
+
+COMMIT;
+";
+
+    my $PSQL_OPTS = "-h $PGHOST -p $PGPORT -U $PGUSER";
+
+    &_debug("psql $PSQL_OPTS -t -A -F' ' $DBNAME");
+
+    my @rs = &ExecuteQuery($q);
+
+    @rs;
+}
+
+# -------------------------------------------------------------
+# Update a cache file with the latest statistics data
+# and the previous ones.
+# -------------------------------------------------------------
+sub RefreshCache {
+    my @rs = &GetStatistics;
+    
+    my $write_data;
+
+    # Write current cache data as previous values.
+    foreach (@CACHE_DATA)
+    {
+	$write_data .= $_;
+    }
+    $write_data .= "\n";
+
+    # Write the latest statistics as a cache.
+    foreach (@rs)
+    {
+	$write_data .= $_;
+    }
+    $write_data .= "\n";
+
+    # Cache file must have fixed size (512 bytes).
+    &UpdateCache($cache_file, $write_data, 512);
+
+    &_debug("Cache file `" . $cache_file . "' updated.");
+}
+
+# -------------------------------------------------------------
+# Read statistics data from the cache file into arrays.
+# -------------------------------------------------------------
+sub ReadCache {
+    if ( ! -f $cache_file )
+    {
+	&_debug("Cache file not found.");
+	return 0;
+    }
+
+    open(F, $cache_file) || die($!);
+
+    @PREV_DATA = ();
+    @CACHE_DATA = ();
+
+    # prev values
+    while(<F>)
+    {
+	if ( /^\n/ )
+	{
+	    last;
+	}
+	push(@PREV_DATA, $_);
+    }
+
+    # cache values
+    while(<F>)
+    {
+	if ( /^\n/ )
+	{
+	    last;
+	}
+	push(@CACHE_DATA, $_);
+    }
+    close(F);
+
+    return 1;
+}
+
+# -------------------------------------------------------------------------
+# Print session statistics.
+#
+# Output format:
+#   active,<active>
+#   idle,<idle>
+#   wait,<wait on lock>
+# -------------------------------------------------------------------------
+sub print_session {
+    foreach (@CACHE_DATA)
+    {
+	my @v;
+	chomp;
+	if ( /^session/ )
+	{
+	    @v = split(/ +/);
+	    print "active," . $v[1] . "\n";
+	    print "idle," . $v[2] . "\n";
+	    print "wait," . $v[3] . "\n";
+	}
+    }
+}
+
+# -------------------------------------------------------------------------
+# Print database size.
+#
+# Output format:
+#   dbsize,<database size in GB>
+# -------------------------------------------------------------------------
+sub print_dbsize {
+    foreach (@CACHE_DATA)
+    {
+	my @v;
+	chomp;
+	if ( /^dbsize/ )
+	{
+	    @v = split(/ +/);
+	    print "dbsize," . ($v[1]/1024/1024/1024) . "\n";
+	}
+    }
+}
+
+# -------------------------------------------------------------------------
+# Print transaction statistics.
+#
+# Output format:
+#   txn_commit,<committed transactions>
+#   txn_rollback,<rolled-back transactions>
+# -------------------------------------------------------------------------
+sub print_txn {
+    my $line1;
+    my $line2;
+
+    foreach (@PREV_DATA)
+    {
+	chomp;
+	if ( /^txn/ )
+	{
+	    $line1 = $_;
+	}
+    }
+
+    foreach (@CACHE_DATA)
+    {
+	chomp;
+	if ( /^txn/ )
+	{
+	    $line2 = $_;
+	}
+    }
+
+    &_debug("txn line1-> " . $line1);
+    &_debug("txn line2-> " . $line2);
+
+    my $res = &calc_diff($line1, $line2);
+
+    &_debug("txn-> " . $res);
+
+    my @v = split(/ +/, $res);
+
+    @v;
+
+    my $interval = &get_interval();
+
+    print "txn_commit," . $v[1]/$interval . "\n";
+    print "txn_rollback," . $v[2]/$interval . "\n";
+}
+
+sub get_blks_stat {
+    my $line1;
+    my $line2;
+    my $res;
+
+    # blks <read> <hit> <chkpt> <bgw> <bkend>
+    foreach (@PREV_DATA)
+    {
+	if ( /^blks/ )
+	{
+	    $line1 = $_;
+	}
+    }
+    foreach (@CACHE_DATA)
+    {
+	if ( /^blks/ )
+	{
+	    $line2 = $_;
+	}
+    }
+
+    $res = &calc_diff($line1, $line2);
+
+    &_debug($res);
+
+    my @v = split(/ +/, $res);
+
+    @v;
+}
+
+# -------------------------------------------------------------------------
+# Print blocks read statistics.
+#
+# Output format:
+#   blks_read,<blocks read>
+# -------------------------------------------------------------------------
+sub print_blks_read {
+    my @v = &get_blks_stat();
+
+    my $interval = &get_interval();
+
+    print "blks_read," . $v[1]/$interval . "\n";
+}
+
+# -------------------------------------------------------------------------
+# Print blocks written statistics.
+#
+# Output format:
+#   blks_wrtn_chkpt,<by checkpoint>
+#   blks_wrtn_bgw,<by bgwriter>
+#   blks_wrtn_bkend,<by backend>
+# -------------------------------------------------------------------------
+sub print_blks_wrtn {
+    my @v = &get_blks_stat();
+
+    my $interval = &get_interval();
+
+    print "blks_wrtn_chkpt," . $v[3]/$interval . "\n";
+    print "blks_wrtn_bgw," . $v[4]/$interval . "\n";
+    print "blks_wrtn_bkend," . $v[5]/$interval . "\n";
+}
+
+sub get_tuple_stat {
+    my $line1;
+    my $line2;
+    my $res;
+
+    # tuples <returned> <fetched> <inserted> <updated> <deleted>
+    foreach (@PREV_DATA)
+    {
+	if ( /^tuples/ )
+	{
+	    $line1 = $_;
+	}
+    }
+    foreach (@CACHE_DATA)
+    {
+	if ( /^tuples/ )
+	{
+	    $line2 = $_;
+	}
+    }
+
+    $res = &calc_diff($line1, $line2);
+
+    &_debug($res);
+
+    my @v = split(/ +/, $res);
+
+    @v;
+}
+
+# -------------------------------------------------------------------------
+# Print tuples read statistics.
+#
+# Output format:
+#   tup_returned,<tuples returned>
+#   tup_fetched,<tuples fetched>
+# -------------------------------------------------------------------------
+sub print_tuple_read {
+    my @v = &get_tuple_stat();
+
+    my $interval = &get_interval();
+
+    print "tup_returned," . $v[1]/$interval . "\n";
+    print "tup_fetched," . $v[2]/$interval . "\n";
+}
+
+# -------------------------------------------------------------------------
+# Print tuples written statistics.
+#
+# Output format:
+#   tup_inserted,<tuples inserted>
+#   tup_updated,<tuples updated>
+#   tup_deleted,<tuples deleted>
+# -------------------------------------------------------------------------
+sub print_tuple_wrtn {
+    my @v = &get_tuple_stat();
+
+    my $interval = &get_interval();
+
+    print "tup_inserted," . $v[3]/$interval . "\n";
+    print "tup_updated," . $v[4]/$interval . "\n";
+    print "tup_deleted," . $v[5]/$interval . "\n";
+}
+
+# -------------------------------------------------------------------------
+# Print the cache hit ratio.
+#
+# Output format:
+#   cache_hit,<cache hit ratio: 0.00~100.00>
+# -------------------------------------------------------------------------
+sub print_cache_hit {
+    my @v = &get_blks_stat();
+
+    my $ratio = $v[2] / ($v[1] + $v[2]);
+
+    &_debug("read: " . $v[1] . ", hit: " . $v[2]);
+
+    print "cache_hit," . ($ratio*100) . "\n";
+}
+
+# -------------------------------------------------------------------------
+# Calculate a difference between two xlog locations in bytes.
+#
+# Example:
+#   Location 1: 12/E305AE00
+#   Location 2: 12/E306AB00
+#   Result: 64768 (in bytes)
+# -------------------------------------------------------------------------
+sub calc_diff_xlog {
+    my $line1 = $_[0];
+    my $line2 = $_[1];
+    my $xlog1u;
+    my $xlog1l;
+    my $xlog2u;
+    my $xlog2l;
+    my $diff;
+
+    if ( $line1 =~ /([A-Z0-9]+)\/([A-Z0-9]+)/ )
+    {
+        $xlog1u = hex($1);
+        $xlog1l = hex($2);
+    }
+    if ( $line2 =~ /([A-Z0-9]+)\/([A-Z0-9]+)/ )
+    {
+        $xlog2u = hex($1);
+        $xlog2l = hex($2);
+    }
+
+    if ( $xlog2u > $xlog1u )
+    {
+        $diff += hex('FFFFFFFF');
+    }
+    $diff += $xlog2l - $xlog1l;
+
+    $diff;
+}
+
+# -------------------------------------------------------------------------
+# Print a xlog written size.
+#
+# Output format:
+#   "xlog_wrtn,<xlog written in MB/sec>
+# -------------------------------------------------------------------------
+sub print_xlog_wrtn {
+    my $line1;
+    my $line2;
+    my $res;
+
+    # xlog <written_loc> <inserted_loc>
+    foreach (@PREV_DATA)
+    {
+	if ( /^xlog/ )
+	{
+	    $line1 = $_;
+	}
+    }
+    foreach (@CACHE_DATA)
+    {
+	if ( /^xlog/ )
+	{
+	    $line2 = $_;
+	}
+    }
+
+    my @v1 = split(/ +/, $line1);
+    my @v2 = split(/ +/, $line2);
+
+    &_debug("xlog_wrtn: " . $v1[1] . " -> " . $v2[1]);
+
+    my $xlog_wrtn = &calc_diff_xlog($v1[1], $v2[1]);
+
+    my $interval = &get_interval();
+
+    print "xlog_wrtn," . sprintf("%.3f", $xlog_wrtn/$interval/1024/1024) . "\n";
+}
+
+# -------------------------------------------------------------------------
+# Print lock statistics.
+#
+# Output format:
+#   locks_acquired,<locks acquired>
+#   locks_wait,<locks on waiting>
+# -------------------------------------------------------------------------
+sub print_locks {
+    my @v;
+
+    foreach (@CACHE_DATA)
+    {
+	chomp;
+	if ( /^locks/ )
+	{
+	    @v = split(/ +/);
+	}
+    }
+
+    print "locks_acquired," . $v[1] . "\n";
+    print "locks_wait," . $v[2] . "\n";
+}
+
+
+&parse_opts;
+
+$search_key = shift;
+
+if ( !$search_key )
+{
+    &print_usage;
+    exit;
+}
+
+&_debug("PGHOST-> " . $PGHOST);
+&_debug("PGPORT-> " . $PGPORT);
+&_debug("PGUSER-> " . $PGUSER);
+&_debug("DBNAME-> " . $DBNAME);
+&_debug("KEY-> " . $search_key);
+&_debug("CACHE-> " . $cache_file);
+
+if ( !&check_search_key($search_key) )
+{
+    &_error("invalid search key - `" . $search_key . "'.");
+    &print_usage();
+    exit;
+}
+
+&ReadCache();
+
+# If the cache needs to be expired, retreive the latest
+# statistics, and update the cache file with them.
+# Then, read them again.
+if ( &IsCacheRefreshNeeded() )
+{
+    &RefreshCache();
+    &ReadCache();
+}
+
+my $prev_exists = 0;
+if ( $#PREV_DATA >= 0 )
+{
+    $prev_exists = 1;
+}
+&_debug("prev_exists-> " . $prev_exists);
+
+if ( $search_key eq "session" )
+{
+    &print_session();
+}
+
+if ( $search_key eq "dbsize" )
+{
+    &print_dbsize();
+}
+
+if ( $search_key eq "txn" )
+{
+    &print_txn();
+}
+
+if ( $search_key eq "blks_read" )
+{
+    if ( $prev_exists )
+    {
+	&print_blks_read();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "blks_wrtn" )
+{
+    if ( $prev_exists )
+    {
+	&print_blks_wrtn();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "tuple_read" )
+{
+    if ( $prev_exists )
+    {
+	&print_tuple_read();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "tuple_wrtn" )
+{
+    if ( $prev_exists )
+    {
+	&print_tuple_wrtn();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "cache_hit" )
+{
+    if ( $prev_exists )
+    {
+	&print_cache_hit();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "xlog_wrtn" )
+{
+    if ( $prev_exists )
+    {
+	&print_xlog_wrtn();
+    }
+    else
+    {
+	&_debug("Prev cache file not found.");
+    }
+}
+
+if ( $search_key eq "locks" )
+{
+    &print_locks();
+}
+
+exit;
