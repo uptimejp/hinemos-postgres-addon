@@ -23,19 +23,19 @@ use strict vars;
 use Getopt::Std;
 use POSIX qw(strftime);
 use FileHandle;
-use IPC::Open2;
+use IPC::Open3;
 use POSIX qw(strftime);
 
 my $PGHOST = 'localhost';
 my $PGPORT = 5432;
 my $PGUSER = 'postgres';
 my $DBNAME = 'postgres';
+my $VERSION;
 
 my @CACHE_DATA = ();
 my @PREV_DATA = ();
 
 my $cache_file = '/var/tmp/mon_pgsql.cache';
-#my $log_file;
 my $log_file = '/opt/hinemos_agent/var/log/mon_pgsql.log';
 
 my $search_key;
@@ -50,7 +50,7 @@ sub _debug {
     {
 	if ( $log_file )
 	{
-	    open(LOG, ">> $log_file") || die($!);
+	    open(LOG, ">> $log_file") || die($! . "($log_file)");
 	    print LOG $ts . "DEBUG: " . $msg . "\n";
 	    close(LOG);
 	}
@@ -68,8 +68,8 @@ sub _error {
 
     if ( $log_file )
     {
-	open(LOG, ">> $log_file") || die($!);
-	print $ts . "ERROR: " . $msg . "\n";
+	open(LOG, ">> $log_file") || die($! . "($log_file)");
+	print LOG $ts . "ERROR: " . $msg . "\n";
 	close(LOG);
     }
     else
@@ -81,7 +81,7 @@ sub _error {
 sub parse_opts {
     my %opts = ();
 
-    getopts("h:p:U:d:v", \%opts);
+    getopts("h:p:U:d:l:v", \%opts);
 
     if ( $opts{'h'} )
     {
@@ -101,7 +101,7 @@ sub parse_opts {
     }
     if ( $opts{'l'} )
     {
-	$log_file = '/opt/hinemos_agent/var/log/mon_pgsql.log';
+	$log_file = $opts{'l'};
     }
     if ( $opts{'v'} )
     {
@@ -118,6 +118,7 @@ sub print_usage {
     print "    -p <port>     Port number to connect the database.\n";
     print "    -U <user>     User name used to connect the database.\n";
     print "    -d <dbname>   Database name to be connected.\n";
+    print "    -l <file>     Log file name for error/debug messages.\n";
     print "    -v            Verbose output.\n";
     print "\n";
     print "Search keys:\n";
@@ -273,19 +274,61 @@ sub calc_diff {
 sub ExecuteQuery {
     my $q = $_[0];
     my @rs;
+    my $failed = 0;
 
     my $PSQL_OPTS = "-h $PGHOST -p $PGPORT -U $PGUSER";
 
-    my $pid = open2(*FIN, *FOUT, "psql $PSQL_OPTS -q -t -A -F' '");
-    print FOUT $q . ";\n";
-    print FOUT "\\q\n";
-    while(<FIN>)
+    my $psql_command = "psql $PSQL_OPTS -q -t -A -F' ' -d $DBNAME";
+    my $pid = open3(*FIN, *FOUT, *FERR, $psql_command);
+    print FIN $q . ";\n";
+    print FIN "\\q\n";
+    while(<FERR>)
+    {
+	if ($_ =~ /ERROR: /)
+	{
+	    $failed = 1;
+	}
+    }
+
+    while(<FOUT>)
     {
 	push(@rs, $_);
     }
-    
+
+    waitpid($pid, 0);
+    my $exit_status = $? >> 8;
+    if ($exit_status != 0)
+    {
+	$failed = 1;
+    }
+
+    if ($failed)
+    {
+	&_error("execution failed. ($psql_command, $q)");
+	exit 3;
+    }
+
     @rs;
 }
+
+sub GetVersion {
+    my $PSQL_OPTS = "-h $PGHOST -p $PGPORT -U $PGUSER";
+
+    my $psql_command = "psql $PSQL_OPTS -q -t -A -c \"select version()\" -d $DBNAME";
+
+    $VERSION=`$psql_command`;
+    if ($VERSION =~ /^PostgreSQL (\d+\.\d+)/)
+    {
+	$VERSION = $1;
+    }
+    else
+    {
+	&_error("Can't get version string.");
+	exit 4;
+    }
+    &_debug("VERSION = $VERSION");
+}
+
 
 # -------------------------------------------------------------
 # Update cache file.
@@ -302,7 +345,7 @@ sub UpdateCache {
     # needs to create an empty cache file at first.
     if ( ! -f $file )
     {
-	open(F, "> $file") || die($!);
+	open(F, "> $file") || die($! . "($file)");
 	for (my $i=0 ; $i < $size ; $i++)
 	{
 	    print F "\n";
@@ -312,7 +355,7 @@ sub UpdateCache {
 
     # overwrite the cache file, and fill the unused space
     # with '\n'.
-    open(F, "+< $file") || die($!);
+    open(F, "+< $file") || die($! . "($file)");
     seek(F, 0, 0);
 
     print F $data;
@@ -330,14 +373,29 @@ sub UpdateCache {
 # views.
 # -------------------------------------------------------------
 sub GetStatistics {
+
+    my 	$query_col;
+
+    # The column name "current_query" was changed in 9.2.
+    # See below for more detail.
+    # http://www.postgresql.org/docs/9.2/static/release-9-2.html#AEN111904
+    if ($VERSION eq "9.0" || $VERSION eq "9.1")
+    {
+	$query_col = "current_query";
+    }
+    else
+    {
+	$query_col = "query";
+    }
+
     my $q = "
 BEGIN;
 
 SELECT 'time', extract(epoch FROM now())::integer;
 
 SELECT 'session',
-       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND current_query NOT LIKE '<IDLE%' ) AS active,
-       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND current_query LIKE '<IDLE%' ) AS idle,
+       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND $query_col NOT LIKE '<IDLE%' ) AS active,
+       (SELECT count(*) FROM pg_stat_activity WHERE waiting='f' AND $query_col LIKE '<IDLE%' ) AS idle,
        (SELECT count(*) FROM pg_stat_activity WHERE waiting='t') AS wait;
 
 SELECT 'txn',
@@ -423,7 +481,7 @@ sub ReadCache {
 	return 0;
     }
 
-    open(F, $cache_file) || die($!);
+    open(F, $cache_file) || die($! . "($cache_file)");
 
     @PREV_DATA = ();
     @CACHE_DATA = ();
@@ -675,7 +733,11 @@ sub print_tuple_wrtn {
 sub print_cache_hit {
     my @v = &get_blks_stat();
 
-    my $ratio = $v[2] / ($v[1] + $v[2]);
+    my $ratio = 0;
+    if ($v[1] + $v[2] > 0)
+    {
+	$ratio = $v[2] / ($v[1] + $v[2]);
+    }
 
     &_debug("read: " . $v[1] . ", hit: " . $v[2]);
 
@@ -789,7 +851,7 @@ $search_key = shift;
 if ( !$search_key )
 {
     &print_usage;
-    exit;
+    exit 1;
 }
 
 &_debug("PGHOST-> " . $PGHOST);
@@ -798,12 +860,13 @@ if ( !$search_key )
 &_debug("DBNAME-> " . $DBNAME);
 &_debug("KEY-> " . $search_key);
 &_debug("CACHE-> " . $cache_file);
+&_debug("LOG_FILE-> " . $log_file);
 
 if ( !&check_search_key($search_key) )
 {
     &_error("invalid search key - `" . $search_key . "'.");
     &print_usage();
-    exit;
+    exit 2;
 }
 
 &ReadCache();
@@ -813,6 +876,11 @@ if ( !&check_search_key($search_key) )
 # Then, read them again.
 if ( &IsCacheRefreshNeeded() )
 {
+    # If $VERSION is not defined, determine by myself.
+    if (!$VERSION)
+    {
+	&GetVersion();
+    }
     &RefreshCache();
     &ReadCache();
 }
@@ -916,4 +984,4 @@ if ( $search_key eq "locks" )
     &print_locks();
 }
 
-exit;
+exit 0;
