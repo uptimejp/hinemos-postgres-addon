@@ -1,0 +1,8 @@
+active,1
+idle,0
+wait,0
+txn_commit,0
+txn_rollback,0
+dbsize,0.0178253054618835
+locks_acquired,10
+locks_wait,0
